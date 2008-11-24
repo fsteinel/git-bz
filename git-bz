@@ -197,7 +197,7 @@ default-priority = ---
 ################################################################################
 
 from ConfigParser import RawConfigParser
-from httplib import HTTPConnection, HTTPSConnection
+import urllib2
 from optparse import OptionParser
 import os
 from pysqlite2 import dbapi2 as sqlite
@@ -578,30 +578,30 @@ class Bug(object):
         self.patches = []
 
         self.cookies = get_bugzilla_cookies(host)
-        if self.https:
-            self.connection = HTTPSConnection(self.host, 443)
-        else:
-            self.connection = HTTPConnection(self.host, 80)
 
-    def _send_request(self, method, url, data=None, headers={}):
-        headers = dict(headers)
+    def _send_request(self, url, data=None):
+        if self.https:
+            self.request = urllib2.Request("https://"+self.host+url)
+        else:
+            self.request = urllib2.Request("http://"+self.host+url)
+
         cookie_string = ("Bugzilla_login=%s; Bugzilla_logincookie=%s" %
                          (self.cookies['Bugzilla_login'], self.cookies['Bugzilla_logincookie']))
-        headers['Cookie'] = cookie_string
-        headers['User-Agent'] = "git-bz"
-
-        self.connection.request(method, url, data, headers)
+        self.request.add_header('Cookie', cookie_string)
+        self.request.add_header('User-Agent', "git-bz")
+        if data:
+            self.request.add_data(data)
+        return urllib2.urlopen(self.request)
 
     def _send_post(self, url, fields, files):
         content_type, body = encode_multipart_formdata(fields, files)
-        self._send_request("POST", url, data=body, headers={ 'Content-Type': content_type })
+        self.request.add_header('Content-Type', content_type)
+        return self._send_request(url, data=body)
 
     def _load(self, id):
         url = "/show_bug.cgi?id=" + id + "&ctype=xml"
 
-        self._send_request("GET", url)
-
-        response = self.connection.getresponse()
+        response = self._send_request(url)
 
         if response.status != 200:
             die ("Failed to retrieve bug information: %d" % response.status)
@@ -633,9 +633,7 @@ class Bug(object):
 
         files = {}
 
-        self._send_post("/post_bug.cgi", fields, files)
-
-        response = self.connection.getresponse()
+        response = self._send_post("/post_bug.cgi", fields, files)
         response_data = response.read()
 
         if response.status != 200:
@@ -665,9 +663,7 @@ class Bug(object):
         files = {}
         files['data'] = (filename, 'text/plain', data)
 
-        self._send_post("/attachment.cgi", fields, files)
-
-        response = self.connection.getresponse()
+        response = self._send_post("/attachment.cgi", fields, files)
         response_data = response.read()
 
         if response.status != 200:
@@ -683,11 +679,11 @@ class Bug(object):
         print "Attached %s" % filename
 
     def download_patch(self, patch):
-        self._send_request("GET", "/attachment.cgi?id=" + str(patch.attach_id))
-
-        response = self.connection.getresponse()
-        if response.status != 200:
-            die ("Failed to download attachment %s: %d" % (patch.attach_id, response.status))
+        try:
+           response = self._send_request("/attachment.cgi?id=" + str(patch.attach_id))
+        except urllib2.HTTPError, e:
+           if e.code != 200:
+               die ("Failed to download attachment %s: %d" % (patch.attach_id, e.code))
 
         return response.read()
 
