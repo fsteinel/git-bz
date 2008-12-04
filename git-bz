@@ -65,6 +65,9 @@
 #
 #    Prompts before actually doing anything to avoid mistakes.
 #
+#    If -e/--edit is specified, then the user can edit the description and
+#    comment for each patch, and (by uncommenting lines) obsolete old patches.
+#
 #    Examples:
 #
 #       # Attach the last commit
@@ -81,9 +84,8 @@
 #
 #     Like 'attach', but files a new bug. Opens an editor for the user to
 #     enter the summary and description for the bug. If only a single commit
-#     is named summary defaults to the subject of the commit, and the description
-#     to the body of the bug. The product and component must be specified unless
-#     you have configured defaults.
+#     is named, the summary defaults to the subject of the commit. The product and
+#     component must be specified unless you have configured defaults.
 #
 #     Examples:
 #
@@ -494,7 +496,8 @@ def get_bugzilla_cookies(host):
 # Based on http://code.activestate.com/recipes/146306/ - Wade Leftwich
 def encode_multipart_formdata(fields, files):
     """
-    fields is a dictionary of { name : value } for regular form fields.
+    fields is a dictionary of { name : value } for regular form fields. if value is a list,
+      one form field is added for each item in the list
     files is a dictionary of { name : ( filename, content_type, value) } for data to be uploaded as files
     Return (content_type, body) ready for httplib.HTTPContent instance
     """
@@ -503,10 +506,17 @@ def encode_multipart_formdata(fields, files):
     L = []
     for key in sorted(fields.keys()):
         value = fields[key]
-        L.append('--' + BOUNDARY)
-        L.append('Content-Disposition: form-data; name="%s"' % key)
-        L.append('')
-        L.append(value)
+        if isinstance(value, list):
+            for v in value:
+                L.append('--' + BOUNDARY)
+                L.append('Content-Disposition: form-data; name="%s"' % key)
+                L.append('')
+                L.append(v)
+        else:
+            L.append('--' + BOUNDARY)
+            L.append('Content-Disposition: form-data; name="%s"' % key)
+            L.append('')
+            L.append(value)
     for key in sorted(files.keys()):
         (filename, content_type, value) = files[key]
         L.append('--' + BOUNDARY)
@@ -530,7 +540,7 @@ def make_filename(description):
 
     return filename
 
-def edit(filename):
+def edit_file(filename):
     editor = None
     if 'GIT_EDITOR' in os.environ:
         editor = os.environ['GIT_EDITOR']
@@ -548,6 +558,36 @@ def edit(filename):
     process.wait()
     if process.returncode != 0:
         die("Editor exited with non-zero return code")
+
+def edit_template(template):
+    # Prompts the user to edit the text 'template' and returns list of
+    # lines with comments stripped
+
+    handle, filename = tempfile.mkstemp(".txt", "git-bz-")
+    f = os.fdopen(handle, "w")
+    f.write(template)
+    f.close()
+
+    edit_file(filename)
+
+    f = open(filename, "r")
+    lines = filter(lambda x: not x.startswith("#"), f.readlines())
+    f.close
+
+    return lines
+
+def split_subject_body(lines):
+    # Splits the first line (subject) from the subsequent lines (body)
+
+    i = 0
+    subject = ""
+    while i < len(lines):
+        subject = lines[i].strip()
+        if subject != "":
+            break
+        i += 1
+
+    return subject, "".join(lines[i + 1:]).strip()
 
 def prompt(message):
     print message, "[yn] ",
@@ -651,7 +691,7 @@ class Bug(object):
         print "Bug %d - %s" % (self.id, short_desc)
         print self.get_url()
 
-    def create_patch(self, description, comment, filename, data):
+    def create_patch(self, description, comment, filename, data, obsoletes=[]):
         fields = {}
         fields['bugid'] = str(self.id)
         fields['action'] = 'insert'
@@ -659,6 +699,10 @@ class Bug(object):
         fields['description'] = description
         if comment:
             fields['comment'] = comment
+        if obsoletes:
+            # this will produce multiple parts in the encoded data with the
+            # name 'obsolete' for each item in the list
+            fields['obsolete'] = map(str, obsoletes)
 
         files = {}
         files['data'] = (filename, 'text/plain', data)
@@ -827,7 +871,45 @@ def strip_bug_url(bug, commit_body):
     pattern = "\s*" + re.escape(bug.get_url()) + "\s*$"
     return re.sub(pattern, "", commit_body)
 
-def attach_commits(bug, commits, include_comments=True):
+def edit_attachment_comment(bug, initial_description, initial_body):
+    template = StringIO()
+    template.write("# Attachment to Bug %d - %s\n\n" % (bug.id, bug.short_desc))
+    template.write(initial_description)
+    template.write("\n\n")
+    template.write(initial_body)
+    template.write("\n\n")
+    if len(bug.patches) > 0:
+        for patch in bug.patches:
+            template.write("#Obsoletes: %d - %s\n" % (patch.attach_id, patch.description))
+        template.write("\n")
+
+    template.write("""# Please edit the description (first line) and comment (other lines). Lines
+# starting with '#' will be ignored.  Delete everything to abort.
+""")
+    if len(bug.patches) > 0:
+        template.write("# To obsolete existing patches, uncomment the appropriate lines.\n")
+
+    lines = edit_template(template.getvalue())
+
+    obsoletes= []
+    def filter_obsolete(line):
+        m = re.match("^\s*Obsoletes\s*:\s*([\d]+)", line)
+        if m:
+            obsoletes.append(int(m.group(1)))
+            return False
+        else:
+            return True
+
+    lines = filter(filter_obsolete, lines)
+
+    description, comment = split_subject_body(lines)
+
+    if description == "":
+        die("Empty description, aborting")
+
+    return description, comment, obsoletes
+
+def attach_commits(bug, commits, include_comments=True, edit_comments=False):
     # We want to attach the patches in chronological order
     commits = list(commits)
     commits.reverse()
@@ -839,7 +921,12 @@ def attach_commits(bug, commits, include_comments=True):
             body = strip_bug_url(bug, get_body(commit))
         else:
             body = None
-        bug.create_patch(commit.subject, body, filename, patch)
+        if edit_comments:
+            description, body, obsoletes = edit_attachment_comment(bug, commit.subject, body)
+        else:
+            description = commit.subject
+            obsoletes = []
+        bug.create_patch(commit.subject, body, filename, patch, obsoletes=obsoletes)
 
 def do_attach(bug_reference, since_or_revision_range):
     commits = get_commits(since_or_revision_range)
@@ -848,21 +935,25 @@ def do_attach(bug_reference, since_or_revision_range):
 
     bug = Bug.load(bug_reference)
 
-    print "Bug %d - %s" % (bug.id, bug.short_desc)
-    print
+    # We always want to prompt if the user has specified multiple attachments.
+    # For the common case of one attachment don't prompt if we are going
+    # to give them a chance to edit and abort anyways.
+    if len(commits) > 1 or not global_options.edit:
+        print "Bug %d - %s" % (bug.id, bug.short_desc)
+        print
 
-    for commit in commits:
-        print commit.id[0:7], commit.subject
+        for commit in commits:
+            print commit.id[0:7], commit.subject
 
-    print
-    if not prompt("Attach?"):
-        print "Aborting"
-        sys.exit(0)
+        print
+        if not prompt("Attach?"):
+            print "Aborting"
+            sys.exit(0)
 
     if global_options.add_url:
         add_url(bug, commits)
 
-    attach_commits(bug, commits)
+    attach_commits(bug, commits, edit_comments=global_options.edit)
 
 def do_file(*args):
     if len(args) == 1:
@@ -901,8 +992,6 @@ def do_file(*args):
     template = StringIO()
     if len(commits) == 1:
         template.write(commits[0].subject)
-        template.write("\n\n")
-        template.write(get_body(commits[0]))
         template.write("\n")
     template.write("""
 # Please enter the summary (first line) and description (other lines). Lines
@@ -915,36 +1004,28 @@ def do_file(*args):
     for commit in commits:
         template.write("#   " + commit.id[0:7] + " " + commit.subject + "\n")
 
-    handle, filename = tempfile.mkstemp(".txt", "git-bz-")
-    f = os.fdopen(handle, "w")
-    f.write(template.getvalue())
-    f.close()
+    lines = edit_template(template.getvalue())
 
-    edit(filename)
-
-    f = open(filename, "r")
-    lines = filter(lambda x: not x.startswith("#"), f.readlines())
-    f.close()
-
-    i = 0
-    summary = ""
-    while i < len(lines):
-        summary = lines[i].strip()
-        if summary != "":
-            break
-        i += 1
+    summary, description = split_subject_body(lines)
 
     if summary == "":
         die("Empty summary, aborting")
 
-    description = "".join(lines[i + 1:]).strip()
+    # If we have only one patch and no other description for the bug was
+    # specified, use the body of the commit as the the description for
+    # the bug rather than the descriptionfor the attachment
+    include_comments=True
+    if len(commits) == 1:
+        if description == "":
+            description = get_body(commits[0])
+            include_comments = False
 
     bug = Bug.create(get_tracker(), product, component, summary, description)
 
     if global_options.add_url:
         add_url(bug, commits)
 
-    attach_commits(bug, commits, include_comments=(len(commits) > 1))
+    attach_commits(bug, commits, include_comments=include_comments)
 
 ################################################################################
 
@@ -971,6 +1052,10 @@ def add_add_url_option():
     parser.add_option("-u", "--add-url", action="store_true",
                       help="rewrite commits to add the bug URL")
 
+def add_edit_option():
+    parser.add_option("-e", "--edit", action="store_true",
+                      help="allow editing the bugzilla comment")
+
 if command == 'add-url':
     parser.set_usage("git bz add-url [-<N>] [options] <bug reference> [<since | <revision range>]");
     add_num_option()
@@ -983,6 +1068,7 @@ elif command == 'attach':
     parser.set_usage("git bz attach [-<N>] [options] <bug reference> [<since | <revision range>]");
     add_add_url_option()
     add_num_option()
+    add_edit_option()
     min_args = max_args = 2
 elif command == 'file':
     parser.set_usage("git bz file [-<N>] [options] <product>/<component> [<since> | <revision range>]");

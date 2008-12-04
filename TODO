@@ -6,36 +6,23 @@ any intention of working on it myself.
 
 - Owen
 
-Reconsider initial description for 'git bz file'
+Allow omitting bug reference when obvious
 
- Right now, if you have only a single patch, the initial description is the body 
- of the bug, and the attachment is done without any other comment. (But
- still adds a comment to the bug because every attachment has a comment.)
+ When there is only one commit, and -u/--add-url has previously been used,
+ or the commit subject/body contains [Bb]ug #?\d+ you should be able do just:
 
- I often find I want to have a few sentences about why I'm making the
- change different than the body of the commit (or ask someone to look at the
- patch or something), so I've been adding extra text and a separator,
- which leaves it unclear what the stuff after the separator is.
+   git bz attach HEAD^
 
- Better way to handle it:
+Default to -e/--edit when only one commit
 
-  - Start off the initial description empty in the editor
-  - If the user fills it in, use that as the initial description
-    and the body of the commit as the comment.
-  - If the user leaves it empty use the body as the initial description
-    as currently.
+ When there is only one commit to attach, we might as well default to
+ -e/--edit - it's more powerful than the prompt and still allows aborting.
 
-Allow editing comment used for attachments
+Automatically guess obvious obsoletes
 
- When attaching a revised version of a patch, you really want to be
- able to edit the comment to say what has changed. 'attach' should
- support -e/--edit to do this.
-
- In the edit buffer would be commented out lines:
-
- # Obsoletes: 23212 - Frobinificate faster
-
- That you could uncomment to obsolete old patches.
+ When doing attach -e/--edit, and there is an existing patch who's description
+ matches the Subject of the attachment, start the Obsoletes line
+ uncommented?
 
 Use XML-RPC when available.
 
